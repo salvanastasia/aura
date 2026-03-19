@@ -27,19 +27,13 @@ function buildCloud(scene, visW, visH) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
   geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
-  const mat = new THREE.PointsMaterial({
-    size: 0.012,
-    vertexColors: true,
-    sizeAttenuation: true,
-    transparent: true,
-    opacity: 0.65,
-  });
+  const mat = new THREE.PointsMaterial({ size: 0.012, vertexColors: true, sizeAttenuation: true, transparent: true, opacity: 0.65 });
   const pts = new THREE.Points(geo, mat);
   scene.add(pts);
   return pts;
 }
 
-/* ─── Gesture helpers ───────────────────────────────────────────────────── */
+/* ─── Hand analysis helpers ─────────────────────────────────────────────── */
 function handOpenness(lms) {
   if (!lms || lms.length < 21) return 0;
   const palmDiag = Math.hypot(lms[9].x - lms[0].x, lms[9].y - lms[0].y) || 0.001;
@@ -66,29 +60,66 @@ function getPinch(lms) {
   return { isPinching: d < 0.09, midX: (th.x + ix.x) / 2, midY: (th.y + ix.y) / 2, d };
 }
 
+/* ─── Build particle arrays from stored pixel data ──────────────────────── */
+function buildParticles(imgData, visW, visH, resolution, depthSpread) {
+  const { pixels, origW, origH } = imgData;
+
+  const sc = Math.min(resolution / origW, resolution / origH, 1);
+  const sw = Math.max(1, Math.round(origW * sc));
+  const sh = Math.max(1, Math.round(origH * sc));
+
+  const oc = document.createElement("canvas");
+  oc.width = sw;
+  oc.height = sh;
+  const ctx = oc.getContext("2d", { willReadFrequently: true });
+
+  const srcCanvas = document.createElement("canvas");
+  srcCanvas.width = origW;
+  srcCanvas.height = origH;
+  const srcCtx = srcCanvas.getContext("2d");
+  const id = new ImageData(new Uint8ClampedArray(pixels), origW, origH);
+  srcCtx.putImageData(id, 0, 0);
+  ctx.drawImage(srcCanvas, 0, 0, sw, sh);
+
+  let px;
+  try {
+    px = ctx.getImageData(0, 0, sw, sh).data;
+  } catch (e) {
+    console.error("getImageData:", e);
+    return null;
+  }
+
+  const ds = Math.min((visW * 0.8) / sw, (visH * 0.8) / sh);
+  const ox = -(sw * ds) / 2;
+  const oy = (sh * ds) / 2;
+
+  const posArr = [];
+  const colArr = [];
+  const rawZArr = [];
+  for (let y = 0; y < sh; y++) {
+    for (let x = 0; x < sw; x++) {
+      const pi = (y * sw + x) * 4;
+      if (px[pi + 3] < 20) continue;
+      const rz = Math.random() - 0.5;
+      posArr.push(ox + x * ds, oy - y * ds, rz * depthSpread);
+      colArr.push(px[pi] / 255, px[pi + 1] / 255, px[pi + 2] / 255);
+      rawZArr.push(rz);
+    }
+  }
+  return { posArr, colArr, rawZArr };
+}
+
 export default function ParticleField() {
   const mountRef = useRef(null);
   const videoRef = useRef(null);
 
-  const threeRef = useRef({
-    renderer: null,
-    scene: null,
-    camera: null,
-    imageGroup: null,
-    imagePts: null,
-    cloudPts: null,
-    raf: null,
-  });
+  const threeRef = useRef({ renderer: null, scene: null, camera: null, imageGroup: null, imagePts: null, cloudPts: null, raf: null });
   const physRef = useRef({ home: null, rawZ: null, vel: null, count: 0, visW: 0, visH: 0 });
   const handsRef = useRef([]);
 
-  const gestureRef = useRef({
-    velX: 0,
-    velY: 0,
-    prevHandAngle: null,
-    prevAngle2: null,
-    prevDist2: null,
-  });
+  const imgDataRef = useRef(null);
+
+  const gestureRef = useRef({ velX: 0, velY: 0, prevHandAngle: null, prevAngle2: null, prevDist2: null });
 
   const camActiveRef = useRef(false);
   const camRafRef = useRef(null);
@@ -103,6 +134,9 @@ export default function ParticleField() {
   const [gestureMode, setGestureMode] = useState("none");
   const [openness, setOpenness] = useState(0);
 
+  const [density, setDensity] = useState(150);
+  const [baseCount, setBaseCount] = useState(0);
+
   const [pSize, setPSize] = useState(0.018);
   const [depthSpread, setDepthSpread] = useState(0.5);
   const [rRadius, setRRadius] = useState(0.65);
@@ -114,7 +148,7 @@ export default function ParticleField() {
 
   const pr = useRef({});
   useEffect(() => {
-    pr.current = { pSize, depthSpread, rRadius, rStrength, retSpeed, turbulence, damping, rotInertia };
+    pr.current = { pSize, depthSpread, rRadius, rStrength, retSpeed, turbulence, damping, rotInertia, density };
   });
 
   const gesTimerRef = useRef(null);
@@ -186,6 +220,58 @@ export default function ParticleField() {
     document.head.appendChild(s);
   }, []);
 
+  const rebuildMesh = useCallback((resolution, dpt) => {
+    if (!imgDataRef.current) return;
+
+    const { visW, visH } = physRef.current;
+    const { imageGroup } = threeRef.current;
+
+    const result = buildParticles(imgDataRef.current, visW, visH, resolution, dpt);
+    if (!result) return;
+    const { posArr, colArr, rawZArr } = result;
+    if (!posArr.length) return;
+
+    const count = posArr.length / 3;
+    const homeArr = new Float32Array(posArr);
+    for (let i = 0; i < count; i++) homeArr[i * 3 + 2] = 0;
+
+    physRef.current.home = homeArr;
+    physRef.current.rawZ = new Float32Array(rawZArr);
+    physRef.current.vel = new Float32Array(count * 3).fill(0);
+    physRef.current.count = count;
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(posArr), 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(colArr), 3));
+    const mat = new THREE.PointsMaterial({ size: pr.current.pSize, vertexColors: true, sizeAttenuation: true });
+
+    if (threeRef.current.imagePts) {
+      imageGroup.remove(threeRef.current.imagePts);
+      threeRef.current.imagePts.geometry.dispose();
+      threeRef.current.imagePts.material.dispose();
+    }
+
+    const pts = new THREE.Points(geo, mat);
+    imageGroup.add(pts);
+    threeRef.current.imagePts = pts;
+
+    gestureRef.current.velX = 0;
+    gestureRef.current.velY = 0;
+    setPCount(count);
+  }, []);
+
+  const densityTimerRef = useRef(null);
+  const handleDensityChange = useCallback(
+    (val) => {
+      setDensity(val);
+      clearTimeout(densityTimerRef.current);
+      densityTimerRef.current = setTimeout(() => {
+        rebuildMesh(val, pr.current.depthSpread);
+      }, 120);
+    },
+    [rebuildMesh],
+  );
+
   const startAnim = useCallback(() => {
     cancelAnimationFrame(threeRef.current.raf);
     const { renderer, scene, camera } = threeRef.current;
@@ -213,24 +299,18 @@ export default function ParticleField() {
         if (hands.length >= 2) {
           const p1 = getPinch(hands[0]);
           const p2 = getPinch(hands[1]);
-
           if (p1?.isPinching && p2?.isPinching) {
             signalGesture("pinch2");
-
             const angle = Math.atan2(p2.midY - p1.midY, p2.midX - p1.midX);
             const dist = Math.hypot(p2.midX - p1.midX, p2.midY - p1.midY);
-
             if (g.prevAngle2 !== null) {
               let da = angle - g.prevAngle2;
               if (da > Math.PI) da -= 2 * Math.PI;
               if (da < -Math.PI) da += 2 * Math.PI;
-              imageGroup.rotation.z -= da;
-
+              imageGroup.rotation.z += da;
               const sf = dist / (g.prevDist2 || dist);
-              const ns = imageGroup.scale.x * sf;
-              imageGroup.scale.setScalar(Math.max(0.05, Math.min(10, ns)));
+              imageGroup.scale.setScalar(Math.max(0.05, Math.min(10, imageGroup.scale.x * sf)));
             }
-
             g.prevAngle2 = angle;
             g.prevDist2 = dist;
             g.prevHandAngle = null;
@@ -241,24 +321,19 @@ export default function ParticleField() {
         } else if (hands.length === 1) {
           g.prevAngle2 = null;
           g.prevDist2 = null;
-
           const lms = hands[0];
           const open = handOpenness(lms);
-
           opennessFrameRef.current++;
           if (opennessFrameRef.current % 4 === 0) setOpenness(open);
-
           const isSemiOpen = open > 0.45 && open < 0.9;
-
           if (isSemiOpen) {
             signalGesture("flower");
             const angle = handAngle(lms);
-
             if (g.prevHandAngle !== null) {
               let da = angle - g.prevHandAngle;
               if (da > Math.PI) da -= 2 * Math.PI;
               if (da < -Math.PI) da += 2 * Math.PI;
-              g.velY += da * 4.5;
+              g.velY -= da * 4.5;
             }
             g.prevHandAngle = angle;
           } else {
@@ -269,7 +344,6 @@ export default function ParticleField() {
           g.prevAngle2 = null;
           g.prevDist2 = null;
           g.prevHandAngle = null;
-          if (opennessFrameRef.current % 8 === 0) setOpenness(0);
           signalGesture("none");
         }
 
@@ -284,17 +358,14 @@ export default function ParticleField() {
       if (pts && home && rawZ && vel && count > 0) {
         const pos = pts.geometry.attributes.position.array;
         if (pts.material.size !== sz) pts.material.size = sz;
-
         for (let i = 0; i < count; i++) {
           const i3 = i * 3;
           const px = pos[i3];
           const py = pos[i3 + 1];
           const pz = pos[i3 + 2];
-
           vel[i3] += (home[i3] - px) * ret;
           vel[i3 + 1] += (home[i3 + 1] - py) * ret;
           vel[i3 + 2] += (rawZ[i] * dpt - pz) * ret * 0.35;
-
           for (const hand of hands) {
             for (const lm of hand) {
               const wx = (1 - lm.x) * visW - visW / 2;
@@ -309,19 +380,15 @@ export default function ParticleField() {
               }
             }
           }
-
           vel[i3] = (vel[i3] + (Math.random() - 0.5) * tb) * dp;
           vel[i3 + 1] = (vel[i3 + 1] + (Math.random() - 0.5) * tb) * dp;
           vel[i3 + 2] = (vel[i3 + 2] + (Math.random() - 0.5) * tb * 0.2) * dp;
-
           pos[i3] += vel[i3];
           pos[i3 + 1] += vel[i3 + 1];
           pos[i3 + 2] += vel[i3 + 2];
         }
-
         pts.geometry.attributes.position.needsUpdate = true;
       }
-
       renderer.render(scene, camera);
     };
     loop();
@@ -360,79 +427,34 @@ export default function ParticleField() {
           const { imageGroup, cloudPts } = threeRef.current;
           const { visW, visH } = physRef.current;
 
-          const MAX = 150;
-          const sc = Math.min(MAX / img.width, MAX / img.height, 1);
+          const CAP = 400;
+          const sc = Math.min(CAP / img.width, CAP / img.height, 1);
           const sw = Math.max(1, Math.round(img.width * sc));
           const sh = Math.max(1, Math.round(img.height * sc));
-
           const oc = document.createElement("canvas");
           oc.width = sw;
           oc.height = sh;
           const ctx = oc.getContext("2d", { willReadFrequently: true });
           ctx.drawImage(img, 0, 0, sw, sh);
-
-          let px;
+          let rawPx;
           try {
-            px = ctx.getImageData(0, 0, sw, sh).data;
+            rawPx = ctx.getImageData(0, 0, sw, sh).data;
           } catch (e) {
             console.error("getImageData:", e);
             return;
           }
 
-          const ds = Math.min((visW * 0.8) / sw, (visH * 0.8) / sh);
-          const ox = -(sw * ds) / 2;
-          const oy = (sh * ds) / 2;
-          const dpt = pr.current.depthSpread;
+          imgDataRef.current = { pixels: new Uint8ClampedArray(rawPx), origW: sw, origH: sh };
 
-          const posArr = [];
-          const colArr = [];
-          const rawZArr = [];
-          for (let y = 0; y < sh; y++) {
-            for (let x = 0; x < sw; x++) {
-              const pi = (y * sw + x) * 4;
-              if (px[pi + 3] < 20) continue;
-              const rz = Math.random() - 0.5;
-              posArr.push(ox + x * ds, oy - y * ds, rz * dpt);
-              colArr.push(px[pi] / 255, px[pi + 1] / 255, px[pi + 2] / 255);
-              rawZArr.push(rz);
-            }
-          }
-          if (!posArr.length) return;
+          const baseRes = buildParticles(imgDataRef.current, visW, visH, 150, 0);
+          const base = baseRes ? baseRes.posArr.length / 3 : 0;
+          setBaseCount(base);
 
-          const count = posArr.length / 3;
-          const homeArr = new Float32Array(posArr);
-          for (let i = 0; i < count; i++) homeArr[i * 3 + 2] = 0;
-
-          physRef.current.home = homeArr;
-          physRef.current.rawZ = new Float32Array(rawZArr);
-          physRef.current.vel = new Float32Array(count * 3).fill(0);
-          physRef.current.count = count;
-
-          const geo = new THREE.BufferGeometry();
-          geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(posArr), 3));
-          geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(colArr), 3));
-          const mat = new THREE.PointsMaterial({
-            size: pr.current.pSize,
-            vertexColors: true,
-            sizeAttenuation: true,
-          });
-
-          if (threeRef.current.imagePts) {
-            imageGroup.remove(threeRef.current.imagePts);
-            threeRef.current.imagePts.geometry.dispose();
-            threeRef.current.imagePts.material.dispose();
-          }
           if (cloudPts) cloudPts.visible = false;
           imageGroup.rotation.set(0, 0, 0);
           imageGroup.scale.setScalar(1);
-          gestureRef.current.velX = 0;
-          gestureRef.current.velY = 0;
 
-          const pts = new THREE.Points(geo, mat);
-          imageGroup.add(pts);
-          threeRef.current.imagePts = pts;
-
-          setPCount(count);
+          rebuildMesh(pr.current.density, pr.current.depthSpread);
           setImgLoaded(true);
           startAnim();
         };
@@ -440,7 +462,7 @@ export default function ParticleField() {
       };
       reader.readAsDataURL(file);
     },
-    [startAnim],
+    [rebuildMesh, startAnim],
   );
 
   const toggleCam = useCallback(async () => {
@@ -458,31 +480,19 @@ export default function ParticleField() {
     if (!mpReady) return;
     setCamError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 640, height: 480, facingMode: "user" },
-        audio: false,
-      });
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" }, audio: false });
       streamRef.current = stream;
       const vid = videoRef.current;
       vid.srcObject = stream;
       vid.playsInline = true;
       vid.muted = true;
       await vid.play();
-
-      const H = new window.Hands({
-        locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`,
-      });
-      H.setOptions({
-        maxNumHands: 2,
-        modelComplexity: 1,
-        minDetectionConfidence: 0.65,
-        minTrackingConfidence: 0.5,
-      });
+      const H = new window.Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+      H.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.65, minTrackingConfidence: 0.5 });
       H.onResults((r) => {
         handsRef.current = r.multiHandLandmarks ?? [];
       });
       await H.initialize();
-
       camActiveRef.current = true;
       const sendFrame = async () => {
         if (!camActiveRef.current) return;
@@ -516,6 +526,7 @@ export default function ParticleField() {
       cancelAnimationFrame(camRafRef.current);
       streamRef.current?.getTracks().forEach((t) => t.stop());
       clearTimeout(gesTimerRef.current);
+      clearTimeout(densityTimerRef.current);
     },
     [],
   );
@@ -536,15 +547,17 @@ export default function ParticleField() {
     [loadImg],
   );
 
+  const extraParticles = Math.max(0, pCount - baseCount);
+
   const sliders = [
-    { label: "Particle Size", val: pSize, set: setPSize, min: 0.005, max: 0.05, step: 0.001 },
-    { label: "Depth Spread", val: depthSpread, set: setDepthSpread, min: 0, max: 3, step: 0.05 },
-    { label: "Spin Inertia", val: rotInertia, set: setRotInertia, min: 0.5, max: 0.99, step: 0.01 },
-    { label: "Repulsion Radius", val: rRadius, set: setRRadius, min: 0.1, max: 2.0, step: 0.05 },
-    { label: "Repulsion Force", val: rStrength, set: setRStrength, min: 0, max: 0.3, step: 0.005 },
-    { label: "Return Speed", val: retSpeed, set: setRetSpeed, min: 0.01, max: 0.18, step: 0.005 },
-    { label: "Turbulence", val: turbulence, set: setTurbulence, min: 0, max: 0.02, step: 0.0005 },
-    { label: "Damping", val: damping, set: setDamping, min: 0.7, max: 0.99, step: 0.01 },
+    { label: "Particle Size", val: pSize, set: setPSize, min: 0.005, max: 0.05, step: 0.001, special: null },
+    { label: "Depth Spread", val: depthSpread, set: setDepthSpread, min: 0, max: 3, step: 0.05, special: null },
+    { label: "Spin Inertia", val: rotInertia, set: setRotInertia, min: 0.5, max: 0.99, step: 0.01, special: null },
+    { label: "Repulsion Radius", val: rRadius, set: setRRadius, min: 0.1, max: 2.0, step: 0.05, special: null },
+    { label: "Repulsion Force", val: rStrength, set: setRStrength, min: 0, max: 0.3, step: 0.005, special: null },
+    { label: "Return Speed", val: retSpeed, set: setRetSpeed, min: 0.01, max: 0.18, step: 0.005, special: null },
+    { label: "Turbulence", val: turbulence, set: setTurbulence, min: 0, max: 0.02, step: 0.0005, special: null },
+    { label: "Damping", val: damping, set: setDamping, min: 0.7, max: 0.99, step: 0.01, special: null },
   ];
 
   const badge =
@@ -572,7 +585,6 @@ export default function ParticleField() {
         }
         html,body,#root{height:100%;}
         .w{display:flex;width:100%;height:100vh;background:var(--bg);color:var(--tx);overflow:hidden;}
-
         .cv{flex:1;position:relative;overflow:hidden;}
         .cv canvas{display:block;}
 
@@ -591,13 +603,7 @@ export default function ParticleField() {
         .pcount{position:absolute;bottom:18px;left:18px;font-size:9px;letter-spacing:.12em;color:var(--td);text-transform:uppercase;}
         .ghint{position:absolute;bottom:18px;right:18px;font-size:8px;letter-spacing:.08em;color:var(--td);text-transform:uppercase;text-align:right;line-height:1.9;}
 
-        .meter{
-          position:absolute;top:18px;right:18px;
-          display:flex;flex-direction:column;gap:5px;
-          background:rgba(0,0,0,.75);border:1px solid var(--bm);
-          padding:10px 12px;border-radius:10px;backdrop-filter:blur(8px);
-          min-width:140px;
-        }
+        .meter{position:absolute;top:18px;right:18px;display:flex;flex-direction:column;gap:5px;background:rgba(0,0,0,.75);border:1px solid var(--bm);padding:10px 12px;border-radius:10px;backdrop-filter:blur(8px);min-width:140px;}
         .meter-label{font-size:8px;letter-spacing:.14em;color:var(--tm);text-transform:uppercase;}
         .meter-bar{height:3px;background:var(--bm);border-radius:2px;overflow:hidden;}
         .meter-fill{height:100%;border-radius:2px;transition:width .1s,background .2s;}
@@ -622,6 +628,16 @@ export default function ParticleField() {
         .gicon{font-size:12px;width:18px;text-align:center;flex-shrink:0;margin-top:1px;}
         .gsub{font-size:8px;color:var(--td);display:block;margin-top:1px;}
 
+        .pcsec{padding:14px 18px;border-bottom:1px solid var(--b);}
+        .pclabel{font-size:8px;letter-spacing:.16em;color:var(--td);text-transform:uppercase;margin-bottom:12px;}
+        .pcrow{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px;}
+        .pctotal{font-size:18px;color:var(--tx);letter-spacing:-.02em;font-weight:300;}
+        .pcextra{font-size:9px;color:var(--ac);letter-spacing:.06em;}
+        .pcbase{font-size:8px;color:var(--td);margin-top:2px;margin-bottom:10px;}
+        .pcslider-meta{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px;}
+        .pcslider-label{font-size:9px;letter-spacing:.1em;color:var(--tm);text-transform:uppercase;}
+        .pcslider-val{font-size:10px;color:var(--tmid);}
+
         .params{padding:18px 18px 0;flex:1;}
         .plabel{font-size:8px;letter-spacing:.2em;color:var(--td);text-transform:uppercase;margin-bottom:18px;}
         .srow{margin-bottom:20px;}
@@ -634,6 +650,9 @@ export default function ParticleField() {
         [data-slot="slider-track"]{background:var(--bm) !important;}
         [data-slot="slider-range"]{background:var(--tm) !important;}
         [data-slot="slider-thumb"]{background:var(--tx) !important;border:none !important;box-shadow:none !important;width:10px !important;height:10px !important;}
+
+        .accent-slider [data-slot="slider-range"] { background: var(--ac) !important; }
+        .accent-slider [data-slot="slider-thumb"] { background: var(--ac) !important; }
       `}</style>
 
       <div className="w">
@@ -654,7 +673,7 @@ export default function ParticleField() {
                 <Sparkles size={20} />
               </div>
               <p className="dt">Drop an image here</p>
-              <p className="ds">PNG - JPG - WebP - any size</p>
+              <p className="ds">PNG · JPG · WebP · any size</p>
               <label className="dl">
                 or browse files
                 <input type="file" accept="image/*" style={{ display: "none" }} onChange={onFile} />
@@ -673,35 +692,30 @@ export default function ParticleField() {
             <div className="meter">
               <div className="meter-label">Hand openness</div>
               <div className="meter-bar">
-                <div
-                  className="meter-fill"
-                  style={{
-                    width: `${openPct}%`,
-                    background: inWindow ? "#a3e635" : openness < 0.45 ? "#ef4444" : "#f59e0b",
-                  }}
-                />
+                <div className="meter-fill" style={{ width: `${openPct}%`, background: inWindow ? "#a3e635" : openness < 0.45 ? "#ef4444" : "#f59e0b" }} />
               </div>
               <div className="meter-hint">
-                {openness < 0.45
-                  ? "too closed - repulsion mode"
-                  : openness < 0.9
-                    ? "flower zone - rotate wrist"
-                    : "too open - close slightly"}
+                {openness < 0.45 ? "too closed — repulsion mode" : openness < 0.9 ? "✦ flower zone — rotate wrist" : "too open — close slightly"}
               </div>
             </div>
           )}
 
-          {imgLoaded && <div className="pcount">{pCount.toLocaleString()} particles</div>}
+          {imgLoaded && (
+            <div className="pcount">
+              {pCount.toLocaleString()} particles
+              {extraParticles > 0 && <span style={{ color: "#a3e635", marginLeft: 6 }}>+{extraParticles.toLocaleString()}</span>}
+            </div>
+          )}
 
           {camOn && imgLoaded && (
             <div className="ghint">
-              open hand - repel
+              open hand → repel
               <br />
-              semi-open + rotate wrist - spin
+              semi-open + rotate wrist → spin
               <br />
-              2-hand pinch + rotate - twist z
+              2-hand pinch + rotate → twist z
               <br />
-              2-hand pinch + spread - zoom
+              2-hand pinch + spread → zoom
             </div>
           )}
 
@@ -716,7 +730,7 @@ export default function ParticleField() {
         <aside className="sb">
           <div className="sh">
             <div className="st">Particle Field</div>
-            <div className="ss">three.js - webgl - mediapipe hands</div>
+            <div className="ss">three.js · webgl · mediapipe hands</div>
           </div>
 
           <div className="sec">
@@ -732,36 +746,52 @@ export default function ParticleField() {
             )}
             <button className={`btn ${camOn ? "stop" : "go"}`} onClick={toggleCam} disabled={!mpReady}>
               {camOn ? <CameraOff size={11} /> : <Camera size={11} />}
-              {!mpReady ? "Loading MediaPipe..." : camOn ? "Stop Camera" : "Start Hand Tracking"}
+              {!mpReady ? "Loading MediaPipe…" : camOn ? "Stop Camera" : "Start Hand Tracking"}
             </button>
             {camError && <p className="err">{camError}</p>}
           </div>
 
-          <div className="gbox">
-            <div className="glabel">Gestures</div>
-            <div className="gline">
-              <span className="gicon">🖐</span>
-              <span>Open hand - repel particles</span>
+          <div className="pcsec">
+            <div className="pclabel">Particle Count</div>
+            <div className="pcrow">
+              <span className="pctotal">{pCount.toLocaleString()}</span>
+              {extraParticles > 0 && <span className="pcextra">+{extraParticles.toLocaleString()} extra</span>}
             </div>
-            <div className="gline">
-              <span className="gicon">🌸</span>
-              <span>
-                Semi-open hand - rotate wrist to spin the image
-                <span className="gsub">fingers half-curled, like holding a glass</span>
-              </span>
+            {baseCount > 0 && <div className="pcbase">baseline {baseCount.toLocaleString()} · max +8 000</div>}
+            <div className="pcslider-meta">
+              <span className="pcslider-label">Density</span>
+              <span className="pcslider-val">{density} px</span>
             </div>
-            <div className="gline">
-              <span className="gicon">🤌</span>
-              <span>Both hands pinch + rotate - twist Z axis</span>
-            </div>
-            <div className="gline">
-              <span className="gicon">↔️</span>
-              <span>Both hands pinch + spread - zoom</span>
+            <div className="accent-slider">
+              <Slider
+                min={60}
+                max={260}
+                step={5}
+                value={[density]}
+                onValueChange={([v]) => {
+                  if (imgLoaded) {
+                    handleDensityChange(v);
+                  } else {
+                    setDensity(v);
+                  }
+                }}
+              />
             </div>
           </div>
 
+          <div className="gbox">
+            <div className="glabel">Gestures</div>
+            <div className="gline"><span className="gicon">🖐</span><span>Open hand — repel particles</span></div>
+            <div className="gline">
+              <span className="gicon">🌸</span>
+              <span>Semi-open + rotate wrist — spin<span className="gsub">fingers half-curled, like holding a glass</span></span>
+            </div>
+            <div className="gline"><span className="gicon">🤌</span><span>Both pinch + rotate — twist Z</span></div>
+            <div className="gline"><span className="gicon">↔️</span><span>Both pinch + spread — zoom</span></div>
+          </div>
+
           <div className="params">
-            <div className="plabel">Parameters</div>
+            <div className="plabel">Physics</div>
             {sliders.map(({ label, val, set, min, max, step }) => {
               const dec = step < 0.001 ? 4 : step < 0.01 ? 3 : step < 0.1 ? 2 : step < 1 ? 1 : 0;
               return (
@@ -778,8 +808,7 @@ export default function ParticleField() {
 
           <div className="foot">
             <p className="ftip">
-              Spin Inertia keeps the model spinning after your hand stops. The live openness meter in the canvas corner
-              shows when your hand is in the flower zone.
+              Drag the Density slider to add up to 8 000 more particles. The mesh rebuilds live — higher counts are more vivid but heavier on the GPU.
             </p>
           </div>
         </aside>
